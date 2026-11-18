@@ -546,6 +546,107 @@ class AsyncioTest(IsolatedAsyncioTestCase):
         self.assertEqual(msg.data(), b'msg-2')
         await reader_inclusive.close()
 
+    async def test_consumer_receive_timeout_keeps_late_message(self):
+        """A receive cancelled by a timeout must not lose the message that the
+        underlying client delivers afterwards; it is returned by the next
+        receive."""
+        topic = f'asyncio-test-consumer-late-{time.time()}'
+        producer = await self._client.create_producer(topic)
+        consumer = await self._client.subscribe(
+            topic, 'sub', initial_position=pulsar.InitialPosition.Earliest)
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(consumer.receive(), 0.3)
+        # Repeated timeouts must not register more than one underlying read.
+        for _ in range(3):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(consumer.receive(), 0.05)
+        self.assertTrue(consumer._reading)
+
+        await producer.send(b'late')
+        # Wait for the late callback to stage its result.
+        for _ in range(100):
+            if consumer._staged:
+                break
+            await asyncio.sleep(0.02)
+        self.assertEqual(len(consumer._staged), 1)
+
+        msg = await asyncio.wait_for(consumer.receive(), TIMEOUT_MS / 1000)
+        self.assertEqual(msg.data(), b'late')
+        self.assertEqual(len(consumer._staged), 0)
+        await consumer.close()
+        await producer.close()
+
+    async def test_consumer_close_fails_pending_receive(self):
+        """Closing a consumer fails a blocked receive with AlreadyClosed and
+        absorbs any callback arriving afterwards."""
+        topic = f'asyncio-test-consumer-close-pending-{time.time()}'
+        consumer = await self._client.subscribe(topic, 'sub')
+        pending = asyncio.create_task(consumer.receive())
+        await asyncio.sleep(0.2)
+        await consumer.close()
+        with self.assertRaises(PulsarException) as ctx:
+            await pending
+        self.assertEqual(ctx.exception.error(), pulsar.Result.AlreadyClosed)
+        # Further receives fail immediately and never raise CancelledError.
+        with self.assertRaises(PulsarException) as ctx:
+            await consumer.receive()
+        self.assertEqual(ctx.exception.error(), pulsar.Result.AlreadyClosed)
+
+    async def test_consumer_cancelled_receive_no_message_lost(self):
+        """Cancelling a pending receive and then publishing still lets the next
+        receive obtain every message exactly once."""
+        topic = f'asyncio-test-consumer-cancel-{time.time()}'
+        producer = await self._client.create_producer(topic)
+        consumer = await self._client.subscribe(
+            topic, 'sub', initial_position=pulsar.InitialPosition.Earliest)
+
+        received = []
+        for i in range(5):
+            task = asyncio.create_task(consumer.receive())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await producer.send(f'm-{i}'.encode())
+            received.append(
+                (await asyncio.wait_for(consumer.receive(),
+                                        TIMEOUT_MS / 1000)).data())
+        self.assertEqual(received, [f'm-{i}'.encode() for i in range(5)])
+        await consumer.close()
+        await producer.close()
+
+    async def test_reader_read_next_timeout_keeps_position(self):
+        """A reader has no ack mechanism: a read_next cancelled by a timeout
+        must not skip the message that arrives later. The advanced position is
+        retained and returned in order by subsequent reads."""
+        topic = f'asyncio-test-reader-late-{time.time()}'
+        producer = await self._client.create_producer(topic)
+        reader = await self._client.create_reader(topic, pulsar.MessageId.earliest)
+
+        for i in range(4):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.read_next(), 0.2)
+            await producer.send(f'r-{i}'.encode())
+            msg = await asyncio.wait_for(reader.read_next(),
+                                         TIMEOUT_MS / 1000)
+            self.assertEqual(msg.data(), f'r-{i}'.encode())
+        await reader.close()
+        await producer.close()
+
+    async def test_reader_close_fails_pending_read_next(self):
+        """Closing a reader fails a blocked read_next with AlreadyClosed."""
+        topic = f'asyncio-test-reader-close-pending-{time.time()}'
+        reader = await self._client.create_reader(topic, pulsar.MessageId.earliest)
+        pending = asyncio.create_task(reader.read_next())
+        await asyncio.sleep(0.2)
+        await reader.close()
+        with self.assertRaises(PulsarException) as ctx:
+            await pending
+        self.assertEqual(ctx.exception.error(), pulsar.Result.AlreadyClosed)
+
     async def test_schema(self):
         class ExampleRecord(Record):  # pylint: disable=too-few-public-methods
             """Example record schema for testing."""

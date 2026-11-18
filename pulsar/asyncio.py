@@ -25,8 +25,9 @@ The Pulsar Python client APIs that work with the asyncio module.
 
 import asyncio
 import functools
+from collections import deque
 from datetime import timedelta
-from typing import Any, Callable, List, Union
+from typing import Any, Callable, Deque, List, Optional, Union
 
 import _pulsar
 from _pulsar import (
@@ -40,6 +41,14 @@ from _pulsar import (
 )
 import pulsar
 from pulsar import _check_type
+
+#: Default capacity of the per-consumer staging queue for results whose waiter
+#: was cancelled. It is bounded so a consumer that stops reading cannot grow
+#: memory without limit; an overflowing message is explicitly returned to the
+#: broker for redelivery (see ``Consumer._handle_staging_overflow``). Readers
+#: have no redelivery mechanism and use an unbounded queue instead, so an
+#: advanced reader position can never skip data.
+_MAX_STAGED_RESULTS = 1000
 
 class PulsarException(Exception):
     """
@@ -73,6 +82,299 @@ class PulsarException(Exception):
         if self._msg:
             return f'{self._result.value} {self._result.name}: {self._msg}'
         return f'{self._result.value} {self._result.name}'
+
+
+class _AsyncReadable:
+    """
+    Lifecycle manager for the asynchronous message-delivery objects
+    (``Consumer.receive`` and ``Reader.read_next``).
+
+    The C++ client does not support cancelling a pending ``receiveAsync`` /
+    ``readNextAsync`` call: the callback is always invoked eventually, even if
+    the asyncio task that initiated the read was cancelled (for example by
+    ``asyncio.wait_for`` timing out). This class makes that contract safe:
+
+    * **Single-flight** — at most one underlying read is registered at any
+      time, so repeated timeouts cannot pile up an unbounded number of pending
+      reads inside the client.
+    * **Bounded staging** — results that arrive after their waiters were
+      cancelled are queued FIFO and handed to later reads, so a message that
+      already left the client's receiver queue is never silently lost. The
+      queue is capped (``max_staged``); consumers return an overflowing message
+      to the broker for redelivery, while readers — which have no
+      acknowledgement/redelivery mechanism — use an unbounded queue so the
+      advanced position never skips data.
+    * **Bounded backlog of waiters** — concurrent callers wait on a single
+      in-flight read instead of each registering their own.
+    * **Deterministic shutdown** — closing fails every pending waiter with
+      ``Result.AlreadyClosed`` and absorbs any callback that arrives later.
+    """
+
+    def __init__(self, schema: pulsar.schema.Schema,
+                 max_staged: Optional[int] = _MAX_STAGED_RESULTS) -> None:
+        self._schema = schema
+        self._loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        # Results (messages or errors) delivered by an underlying read whose
+        # waiters had already been cancelled, kept for subsequent reads.
+        # ``maxlen=None`` means an unbounded FIFO (used by readers).
+        self._staged: Deque[Any] = deque(maxlen=max_staged)
+        # Asyncio tasks currently blocked in the public read coroutine.
+        self._waiters: Deque[asyncio.Future] = deque()
+        # Maps a waiter to the staged message it was handed, so that if the
+        # waiter's task is cancelled before it can consume the message it can
+        # be returned to the staging queue rather than lost.
+        self._delivered: dict = {}
+        # Whether an underlying read is currently registered.
+        self._reading = False
+        self._closed = False
+
+    def _start_underlying_read(self, callback: Callable[..., None]) -> None:
+        """Register one asynchronous read with the C++ client."""
+        raise NotImplementedError
+
+    def _wrap_message(self, message: _pulsar.Message) -> pulsar.Message:
+        m = pulsar.Message()
+        m._message = message
+        m._schema = self._schema
+        return m
+
+    def _staging_is_full(self) -> bool:
+        maxlen = self._staged.maxlen
+        return maxlen is not None and len(self._staged) >= maxlen
+
+    def _handle_staging_overflow(self, message: _pulsar.Message) -> None:
+        """
+        Deal with a late message that cannot be staged because the bounded
+        staging queue is full.
+
+        Consumers give the message back to the broker for redelivery via a
+        negative acknowledgement. Readers use an unbounded queue, so this
+        branch is unreachable for them.
+        """
+
+    def _on_underlying_read_done(self, *args: Any) -> None:
+        """
+        Callback invoked by the C++ client (from a non-asyncio thread) when the
+        single in-flight read completes.
+        """
+        self._loop.call_soon_threadsafe(self._handle_read_done, args)
+
+    def _handle_read_done(self, args: tuple) -> None:
+        self._reading = False
+
+        if self._closed:
+            # The object is shutting down. Fail any waiters explicitly and do
+            # not let late results resurrect state or escape as unhandled
+            # errors.
+            self._fail_waiters(PulsarException(_pulsar.Result.AlreadyClosed))
+            return
+
+        result = self._decode_result(args)
+
+        if isinstance(result, PulsarException):
+            # Errors are never staged: a late error belongs to the read that
+            # was cancelled, not to the next caller. Surface it to a current
+            # waiter, otherwise discard it.
+            waiter = self._pop_waiter()
+            if waiter is not None and not waiter.done():
+                waiter.set_exception(result)
+            # Other concurrent callers still need a read of their own.
+            self._pump()
+            return
+
+        # Successful message delivery.
+        waiter = self._pop_waiter()
+        if waiter is not None and not waiter.done():
+            # Record ownership so the message is reclaimed into staging if the
+            # receiving task is cancelled before it consumes the result.
+            waiter.set_result(result)
+            self._delivered[waiter] = result
+        elif self._staging_is_full():
+            # No live waiter and the bounded queue is full. Do not silently
+            # drop the message: let the concrete class return it for
+            # redelivery (consumer) or keep it (unbounded reader queue).
+            self._handle_staging_overflow(result)
+        else:
+            # The originating read was cancelled: retain the message FIFO for
+            # the next read instead of dropping it.
+            self._staged.append(result)
+
+        # Re-arm a read for any remaining waiters, and match a staged result
+        # with a read that was started while the callback was in flight.
+        self._pump()
+
+    def _decode_result(self, args: tuple) -> Union[_pulsar.Message, PulsarException]:
+        # Both the consumer and reader C++ callbacks have the shape
+        # (Result, Message). The _pulsar.Error form is kept defensively for
+        # v2-style bindings that report failures as a single error object.
+        if len(args) == 2 and isinstance(args[0], _pulsar.Result):
+            result, value = args
+            if result == _pulsar.Result.Ok:
+                return value
+            return PulsarException(result)
+        value = args[0]
+        if isinstance(value, _pulsar.Error):
+            return PulsarException(value.error, value.message)
+        return value
+
+    def _pop_waiter(self) -> Optional[asyncio.Future]:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                return waiter
+        return None
+
+    def _deliver_staged(self) -> None:
+        """
+        Hand staged results to live waiters in FIFO order.
+
+        A cancelled waiter is skipped (it removes itself from the queue in its
+        cancellation handler) and the result stays staged for a later read.
+        The hand-off is recorded in ``_delivered`` keyed by the waiter, whose
+        lifecycle is independent of the calling task's cancellation, so the
+        message can always be reclaimed.
+        """
+        while self._staged and self._waiters:
+            waiter = self._waiters[0]
+            if waiter.done():
+                self._waiters.popleft()
+                self._delivered.pop(waiter, None)
+                continue
+            message = self._staged.popleft()
+            waiter.set_result(message)
+            self._waiters.popleft()
+            self._delivered[waiter] = message
+
+    def _return_to_staging(self, message: _pulsar.Message) -> None:
+        """
+        Put a message back at the front of the staging queue, preserving FIFO
+        order. If a bounded queue is full, the oldest tail entry is displaced
+        and handled through the overflow hook instead of being dropped.
+        """
+        if self._staging_is_full():
+            displaced = self._staged.pop()
+            self._handle_staging_overflow(displaced)
+        self._staged.appendleft(message)
+
+    def _fail_waiters(self, exc: Exception) -> None:
+        while True:
+            waiter = self._pop_waiter()
+            if waiter is None:
+                break
+            if not waiter.done():
+                waiter.set_exception(exc)
+            self._delivered.pop(waiter, None)
+
+    def _pump(self) -> None:
+        """
+        Match staged results with waiters and keep at most one underlying read
+        in flight.
+
+        First, any staged result is handed directly to a waiting caller without
+        touching the client. A new underlying read is then registered only when
+        there is an unsatisfied waiter and none is pending. Reads are therefore
+        lazy: nothing is pre-fetched without a caller, which keeps side-effect
+        sensitive APIs such as ``Reader.has_message_available`` accurate. When a
+        read's waiter is cancelled its late result is staged, and the next read
+        drains that staging queue and re-arms the client here.
+        """
+        if self._closed:
+            return
+
+        self._deliver_staged()
+
+        if self._waiters and not self._reading:
+            self._reading = True
+            try:
+                self._start_underlying_read(self._on_underlying_read_done)
+            except Exception as exc:  # registration itself failed
+                self._reading = False
+                waiter = self._pop_waiter()
+                if waiter is not None and not waiter.done():
+                    waiter.set_exception(exc)
+                else:
+                    raise
+
+    async def _read(self) -> pulsar.Message:
+        """
+        Common implementation of ``Consumer.receive`` / ``Reader.read_next``.
+        """
+        if self._closed:
+            raise PulsarException(_pulsar.Result.AlreadyClosed)
+
+        # The waiter is an internal future resolved by the pump; it is never
+        # cancelled directly, so a result stored on it always stays retrievable
+        # even when the calling task is cancelled. The gate merely bridges the
+        # task's cancellation into this coroutine while mirroring the waiter's
+        # outcome once it resolves.
+        waiter = self._loop.create_future()
+        gate = self._loop.create_future()
+        self._waiters.append(waiter)
+
+        def _mirror(_: asyncio.Future) -> None:
+            if gate.done():
+                return
+            if waiter.cancelled():
+                gate.cancel()
+            else:
+                exc = waiter.exception()
+                if exc is not None:
+                    gate.set_exception(exc)
+                else:
+                    gate.set_result(None)
+
+        waiter.add_done_callback(_mirror)
+        self._pump()
+        try:
+            await gate
+        except asyncio.CancelledError:
+            # A pump triggered during cancellation processing may only now
+            # hand a staged result to this waiter. Run it while the waiter is
+            # still registered so the hand-off is recorded, then detach.
+            self._pump()
+            try:
+                self._waiters.remove(waiter)
+            except ValueError:
+                pass
+            # The waiter is never cancelled (only the gate is), so any result
+            # recorded for it is still retrievable. Reclaim it into staging
+            # for the next read instead of losing it with this task.
+            delivered = self._delivered.pop(waiter, None)
+            if delivered is not None:
+                self._return_to_staging(delivered)
+                self._pump()
+            raise
+
+        self._delivered.pop(waiter, None)
+        raw_message = waiter.result()
+        # A staged result may have satisfied this read while a previously
+        # armed read is blocked further down the stream. Now that the slot is
+        # free again, re-arm so subsequent messages keep flowing.
+        self._pump()
+        return self._wrap_message(raw_message)
+
+    async def _close_readable(self, close_async: Callable[[Callable], None]) -> None:
+        """
+        Shared close sequence: fail pending waiters, run the underlying close,
+        and neutralise any callback still in flight.
+        """
+        if self._closed:
+            raise PulsarException(_pulsar.Result.AlreadyClosed)
+        self._closed = True
+        self._fail_waiters(PulsarException(_pulsar.Result.AlreadyClosed))
+
+        future = self._loop.create_future()
+        close_async(functools.partial(_set_future, future, value=None))
+        try:
+            await future
+        finally:
+            # Any read that completes from now on is absorbed in
+            # _handle_read_done; drain retained state so it is not mistaken for
+            # deliverable data after shutdown.
+            self._staged.clear()
+            self._delivered.clear()
+            self._fail_waiters(PulsarException(_pulsar.Result.AlreadyClosed))
+
 
 class Producer:
     """
@@ -233,7 +535,7 @@ class Producer:
         """
         return self._producer.is_connected()
 
-class Consumer:
+class Consumer(_AsyncReadable):
     """
     The Pulsar message consumer, used to subscribe to messages from a topic.
     """
@@ -251,12 +553,34 @@ class Consumer:
         schema: pulsar.schema.Schema
             The schema of the data that will be received by this consumer.
         """
+        super().__init__(schema)
         self._consumer = consumer
-        self._schema = schema
+
+    def _start_underlying_read(self, callback: Callable[..., None]) -> None:
+        self._consumer.receive_async(callback)
+
+    def _handle_staging_overflow(self, message: _pulsar.Message) -> None:
+        # The bounded staging queue is full. Explicitly give this late message
+        # back to the broker for redelivery instead of silently dropping it.
+        # negative_acknowledge is a blocking client call, so run it off the
+        # event loop thread.
+        async def redeliver() -> None:
+            await asyncio.to_thread(self._consumer.negative_acknowledge, message)
+
+        task = self._loop.create_task(redeliver())
+        task.add_done_callback(_consume_task_exception)
 
     async def receive(self) -> pulsar.Message:
         """
         Receive a single message asynchronously.
+
+        Cancelling the returned coroutine (for example via
+        ``asyncio.wait_for`` timing out) does not cancel the underlying read,
+        which is not cancellable. If the message arrives afterwards it is kept
+        in an internal bounded queue and returned by a later ``receive`` call;
+        if that queue is already full the message is negatively acknowledged
+        for broker redelivery. A message is therefore never silently lost, and
+        never delivered to a task that already gave up.
 
         Returns
         -------
@@ -267,13 +591,7 @@ class Consumer:
         ------
         PulsarException
         """
-        future = asyncio.get_running_loop().create_future()
-        self._consumer.receive_async(functools.partial(_set_future, future))
-        msg = await future
-        m = pulsar.Message()
-        m._message = msg
-        m._schema = self._schema
-        return m
+        return await self._read()
 
     async def acknowledge(
         self,
@@ -403,13 +721,17 @@ class Consumer:
         """
         Close the consumer asynchronously.
 
+        Pending ``receive`` calls fail with a ``PulsarException`` carrying
+        ``Result.AlreadyClosed``. Messages whose underlying read completes
+        during or after closing are no longer delivered; unacknowledged
+        messages remain tracked by the subscription and are redelivered by the
+        broker according to its redelivery policy.
+
         Raises
         ------
         PulsarException
         """
-        future = asyncio.get_running_loop().create_future()
-        self._consumer.close_async(functools.partial(_set_future, future, value=None))
-        await future
+        await self._close_readable(self._consumer.close_async)
 
     async def get_last_message_id(self) -> _pulsar.MessageId:
         """
@@ -449,7 +771,7 @@ class Consumer:
         """
         return self._consumer.consumer_name()
 
-class Reader:
+class Reader(_AsyncReadable):
     """
     The Pulsar topic reader, used to read messages from a topic.
     """
@@ -467,12 +789,22 @@ class Reader:
         schema: pulsar.schema.Schema
             The schema of the data that will be received by this reader.
         """
+        super().__init__(schema, max_staged=None)
         self._reader = reader
-        self._schema = schema
+
+    def _start_underlying_read(self, callback: Callable[..., None]) -> None:
+        self._reader.read_next_async(callback)
 
     async def read_next(self) -> pulsar.Message:
         """
         Read a single message asynchronously.
+
+        Cancelling the returned coroutine (for example via
+        ``asyncio.wait_for`` timing out) does not cancel the underlying read,
+        which is not cancellable. A reader has no acknowledgement mechanism,
+        so a message that arrives after the read was cancelled is retained and
+        returned by the next ``read_next`` call: the reader's advanced
+        position is never skipped over.
 
         Returns
         -------
@@ -483,13 +815,7 @@ class Reader:
         ------
         PulsarException
         """
-        future = asyncio.get_running_loop().create_future()
-        self._reader.read_next_async(functools.partial(_set_future, future))
-        msg = await future
-        m = pulsar.Message()
-        m._message = msg
-        m._schema = self._schema
-        return m
+        return await self._read()
 
     async def has_message_available(self) -> bool:
         """
@@ -529,13 +855,14 @@ class Reader:
         """
         Close the reader asynchronously.
 
+        Pending ``read_next`` calls fail with a ``PulsarException`` carrying
+        ``Result.AlreadyClosed`` and any late callback is absorbed.
+
         Raises
         ------
         PulsarException
         """
-        future = asyncio.get_running_loop().create_future()
-        self._reader.close_async(functools.partial(_set_future, future, value=None))
-        await future
+        await self._close_readable(self._reader.close_async)
 
     def topic(self) -> str:
         """
@@ -1013,6 +1340,14 @@ class Client:
             functools.partial(_set_future, future, value=None)
         )
         await future
+
+def _consume_task_exception(task: asyncio.Task) -> None:
+    """Retrieve a background task's exception so it never surfaces as an
+    unhandled-exception warning."""
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
 
 def _set_future(future: asyncio.Future, result: _pulsar.Result, value: Any):
     def complete():
